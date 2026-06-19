@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "castor-hal"
-version = "0.1.0"
+version = "0.1.1"
 description = "Transport hardware-abstraction layer for robot-md-gateway — one actuator interface fronts serial, CAN/J1939, ISOBUS, ROS 2 and MAVLink."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,9 @@ dependencies = ["robot-md-gateway>=0.5.0a1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.1"]
+# CAN/J1939 read adapter (castor_hal.adapters.j1939) — only needed on real
+# hardware; tests inject a fake bus, so dev does not pull python-can.
+j1939 = ["python-can>=4.0"]
 
 [project.urls]
 Homepage = "https://github.com/RobotRegistryFoundation/castor-hal"

@@ -36,7 +36,7 @@ try:  # pragma: no cover - exercised by environments with/without the gateway
 except ModuleNotFoundError:  # robot-md-gateway not installed
     TransportActuator = None  # type: ignore[assignment]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Transport",
