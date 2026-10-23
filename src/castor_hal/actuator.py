@@ -77,7 +77,9 @@ class TransportActuator:
         transport: a ready ``Transport`` instance (tests / direct use), OR
         factory: ``Callable[[dict], Transport]`` built lazily from the gateway
             ``config`` on first ``execute`` (the entry-point path). Exactly one
-            of ``transport``/``factory`` must be given.
+            of ``transport``/``factory`` must be given. Keep I/O out of the
+            factory and do it in ``open()``: every first call waits for the
+            factory, the gateway's stop included.
         transport_type: with ``factory`` only: the ``Transport`` class it
             builds, read for ``capabilities`` and ``can_estop`` (class
             attributes) to make the declarations above.
@@ -136,16 +138,19 @@ class TransportActuator:
         return self._config_schema
 
     def _ensure_transport(self, config: dict) -> Transport:
-        # Built once, under a lock. robot-md-gateway#35 sends the declared stop
-        # from its own thread while requests run on its worker pool; two first
-        # calls racing here built two transports, and the stop could land on
-        # the one thrown away.
-        if self._transport is None:
-            with self._build_lock:
-                if self._transport is None:
-                    assert self._factory is not None  # guaranteed by __init__
-                    self._transport = self._factory(config or {})
-        self._transport.open()
+        # Built once and opened under one lock. robot-md-gateway#35 sends the
+        # declared stop from its own thread while requests run on its worker
+        # pool. Two first calls racing here built two transports, and the stop
+        # could land on the one thrown away. open() is held too: it is
+        # check-then-act in most adapters, and two first calls opening one
+        # exclusive device left one of them with EBUSY, the stop included.
+        # open() is idempotent, so after the first call this holds the lock
+        # only for a no-op.
+        with self._build_lock:
+            if self._transport is None:
+                assert self._factory is not None  # guaranteed by __init__
+                self._transport = self._factory(config or {})
+            self._transport.open()
         return self._transport
 
     def execute(

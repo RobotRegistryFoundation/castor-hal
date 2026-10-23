@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 
 from castor_hal.actuator import TransportActuator
-from castor_hal.errors import TransportErrorCode
+from castor_hal.errors import TransportError, TransportErrorCode
 from castor_hal.goal import GoalKind, goal_tool_names
-from castor_hal.transport import GoalResult
+from castor_hal.state import TransportState
+from castor_hal.transport import GoalResult, Transport
 
 MANIFEST = Path("ROBOT.md")
 
@@ -330,3 +331,63 @@ def test_a_stop_and_a_goal_on_first_use_reach_the_same_transport(make_fake):
     assert transport.estop_calls == 1                       # the stop reached the one kept
     assert transport.last_goal is not None                  # and so did the goal
     assert outcomes["emergency_stop"].success and outcomes["move"].success
+
+
+class _Exclusive(Transport):
+    """open() as most adapters write it: check, then a slow exclusive open that
+    refuses a second holder (open(2), flock, TIOCEXCL)."""
+
+    capabilities = frozenset({GoalKind.JOINT_POSITIONS})
+    holders = 0
+
+    def __init__(self):
+        self.handle = None
+        self.estop_calls = 0
+
+    def open(self):
+        if self.handle is not None:
+            return
+        time.sleep(0.2)
+        if _Exclusive.holders:
+            raise TransportError(TransportErrorCode.IO_ERROR, "Device or resource busy")
+        _Exclusive.holders += 1
+        self.handle = object()
+
+    def close(self):
+        pass
+
+    def set_goal(self, goal):
+        return GoalResult(reached=True)
+
+    def read_state(self):
+        return TransportState(connected=True, estopped=False, positions={}, timestamp_s=1.0)
+
+    def estop(self):
+        self.estop_calls += 1
+
+
+def test_a_stop_and_a_read_on_first_use_open_an_exclusive_transport_once():
+    """Building once is not enough: the first open() must be once too. With the
+    build locked and the open not, a stop and a request released together each
+    opened the one transport, the second got EBUSY, and when that was the stop,
+    nothing stopped (review of castor-hal#1, round 2, note 1: 5 of 10 trials)."""
+    _Exclusive.holders = 0
+    a = TransportActuator(factory=lambda config: _Exclusive(), transport_type=_Exclusive)
+    start = threading.Barrier(2)
+    outcomes = {}
+
+    def call(tool):
+        start.wait()
+        outcomes[tool] = _exec(a, tool, tier="read")
+
+    threads = [threading.Thread(target=call, args=(tool,))
+               for tool in ("emergency_stop", "read_state")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert outcomes["emergency_stop"].success, outcomes["emergency_stop"].error_message
+    assert outcomes["read_state"].success, outcomes["read_state"].error_message
+    assert a._transport.estop_calls == 1
+    assert _Exclusive.holders == 1
