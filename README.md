@@ -78,7 +78,12 @@ one.
 A transport built lazily with `factory=` declares from `transport_type=` if you
 pass it. Without it, its type is not known when the gateway reads the
 declarations, so they fail safe: every goal tool is declared as motion, and the
-stops are declared.
+stops are declared. If the factory builds something else, or a transport whose
+`can_estop` disagrees with what was declared, the first build logs it at ERROR
+(`transport_type_mismatch`, `stop_declared_but_refused`, `stop_not_declared`)
+and carries on; it never refuses the call. Keep I/O out of the factory and do
+it in `open()`: the build and the first `open()` run under one lock, and every
+first call waits for them, the gateway's stop included.
 
 ## SAFETY (binding)
 

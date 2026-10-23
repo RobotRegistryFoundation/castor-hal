@@ -2,6 +2,7 @@
 Transport and returns a structured ActuatorOutcome. This is the contract the
 whole HAL exists to satisfy, so it's tested hardest."""
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -391,3 +392,102 @@ def test_a_stop_and_a_read_on_first_use_open_an_exclusive_transport_once():
     assert outcomes["read_state"].success, outcomes["read_state"].error_message
     assert a._transport.estop_calls == 1
     assert _Exclusive.holders == 1
+
+
+# -- the first build says, at ERROR, when it is not what was declared ------
+#
+# It never refuses: the first build can be the gateway's own stop (review of
+# castor-hal#1, round 2).
+
+
+def _errors(caplog) -> str:
+    return "\n".join(r.getMessage() for r in caplog.records
+                     if r.name == "castor_hal.actuator" and r.levelno >= logging.ERROR)
+
+
+class _Elsewhere(Transport):
+    """A transport of some other class: it can stop, and accepts only home."""
+
+    capabilities = frozenset({GoalKind.HOME})
+    name = "elsewhere"
+
+    def __init__(self):
+        self.estop_calls = 0
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    def set_goal(self, goal):
+        return GoalResult(reached=True)
+
+    def read_state(self):
+        return TransportState(connected=True, estopped=False, positions={}, timestamp_s=1.0)
+
+    def estop(self):
+        self.estop_calls += 1
+
+
+def test_a_factory_that_builds_another_type_is_logged_and_the_stop_still_runs(make_fake, caplog):
+    a = TransportActuator(factory=lambda config: _Elsewhere(), transport_type=make_fake,
+                          name="arm")
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        out = _exec(a, "emergency_stop", tier="read")
+    assert out.success is True and a._transport.estop_calls == 1
+    assert "transport_type_mismatch" in _errors(caplog)
+    assert "stop_declared_but_refused" not in _errors(caplog)      # both can stop
+    assert "stop_not_declared" not in _errors(caplog)
+
+
+def test_a_lazy_tap_built_without_its_type_is_logged(make_fake, caplog):
+    """The fail-safe declares the four stops before anything is built. When
+    what gets built cannot stop, the gateway counts on stops it will be
+    refused; round 1 found that silent."""
+
+    class Tap(make_fake):
+        capabilities = frozenset()
+        can_estop = False
+
+    a = TransportActuator(factory=lambda config: Tap(), name="tap")
+    assert a.stop_capabilities == STOPS
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success      # logged, not refused
+    assert "stop_declared_but_refused" in _errors(caplog)
+    assert "transport_type_mismatch" not in _errors(caplog)
+
+
+def test_a_declared_tap_whose_factory_builds_a_transport_that_can_stop_is_logged(
+        make_fake, caplog):
+    class Tap(make_fake):
+        capabilities = frozenset()
+        can_estop = False
+
+    a = TransportActuator(factory=lambda config: make_fake(), transport_type=Tap, name="tap")
+    assert a.stop_capabilities == frozenset()
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success
+    assert "stop_not_declared" in _errors(caplog)
+    assert "transport_type_mismatch" in _errors(caplog)
+
+
+def test_a_factory_that_builds_what_it_declared_logs_nothing(make_fake, caplog):
+    a = TransportActuator(factory=lambda config: make_fake(), transport_type=make_fake)
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success
+        assert _exec(a, "emergency_stop", tier="read").success
+    assert _errors(caplog) == ""
+
+
+def test_the_check_never_refuses_the_call_that_built(make_fake, caplog):
+    class Odd(make_fake):
+        @property
+        def can_estop(self):
+            raise RuntimeError("cannot say")
+
+    a = TransportActuator(factory=lambda config: Odd(), transport_type=make_fake)
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        out = _exec(a, "emergency_stop", tier="read")
+    assert out.success is True and a._transport.estop_calls == 1
+    assert "could not check the transport" in _errors(caplog)

@@ -23,6 +23,7 @@ transport instance directly.
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Callable
@@ -82,7 +83,9 @@ class TransportActuator:
             factory, the gateway's stop included.
         transport_type: with ``factory`` only: the ``Transport`` class it
             builds, read for ``capabilities`` and ``can_estop`` (class
-            attributes) to make the declarations above.
+            attributes) to make the declarations above. If the factory builds
+            something else, or a transport whose ``can_estop`` disagrees with
+            the declaration, the first build says so at ERROR and carries on.
         name/description: actuator identity surfaced to the gateway.
         config_schema: JSON-schema-ish dict the gateway may surface.
     """
@@ -118,6 +121,7 @@ class TransportActuator:
                 _ESTOP_TOOLS if getattr(described, "can_estop", True) else frozenset())
         self._transport = transport
         self._factory = factory
+        self._transport_type = transport_type
         self._build_lock = threading.Lock()
         self._name = name or (transport.name if transport is not None else "castor-transport")
         self._description = description or (
@@ -150,8 +154,44 @@ class TransportActuator:
             if self._transport is None:
                 assert self._factory is not None  # guaranteed by __init__
                 self._transport = self._factory(config or {})
+                self._check_built(self._transport)
             self._transport.open()
         return self._transport
+
+    def _check_built(self, transport: Transport) -> None:
+        """Log at ERROR when the transport a factory built is not what the
+        gateway was told. Never raises: the first build can be the gateway's own
+        stop, and refusing that is worse than a wrong declaration. Goals stay
+        bounded either way (the exact spelling against ``motion_capabilities``,
+        then the live transport's ``ensure_supported``); what a mismatch can make
+        wrong is the stop: one the gateway counts on that the transport refuses,
+        or one the transport has that the gateway was never told about."""
+        log = logging.getLogger(__name__)
+        try:
+            if self._transport_type is not None and not isinstance(transport, self._transport_type):
+                log.error(
+                    "transport_type_mismatch: actuator %r declared transport_type %s, but "
+                    "its factory built %s; what it declared to the gateway may be wrong",
+                    self._name, self._transport_type.__name__, type(transport).__name__,
+                )
+            declared = bool(self.stop_capabilities)
+            can_stop = bool(getattr(transport, "can_estop", True))
+            if declared and not can_stop:
+                log.error(
+                    "stop_declared_but_refused: actuator %r declared %s to the gateway as "
+                    "stops, but the transport it built cannot stop (can_estop is False); "
+                    "the gateway counts on a stop this actuator refuses. Pass transport_type=.",
+                    self._name, ", ".join(sorted(self.stop_capabilities)),
+                )
+            elif can_stop and not declared:
+                log.error(
+                    "stop_not_declared: actuator %r declared no stop to the gateway, but the "
+                    "transport it built can stop (can_estop is True); the gateway will not "
+                    "send it a stop on a trip",
+                    self._name,
+                )
+        except Exception:  # a check must never refuse the call that built the transport
+            log.exception("could not check the transport built for actuator %r", self._name)
 
     def execute(
         self,
