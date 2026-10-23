@@ -18,9 +18,14 @@ require an OEM API or a physical retrofit kit (see
 docs/strategy/2026-06-19-gateway-onramp-strategy.md). This adapter never writes
 to the bus.
 
-Install the bus driver with ``pip install castor-hal[j1939]`` (python-can). For
-tests, inject any object with ``recv(timeout) -> frame | None`` and ``shutdown()``
-where ``frame`` has ``.arbitration_id`` (29-bit) and ``.data`` (bytes).
+Install the bus driver, python-can, beside a castor-hal installed from its
+repository:
+``pip install "castor-hal[j1939] @ git+https://github.com/RobotRegistryFoundation/castor-hal"``,
+or ``pip install "python-can>=4.0"`` where castor-hal is already installed.
+castor-hal is not on PyPI, so ``pip install castor-hal[j1939]`` would install
+whatever is later published there under that name. For tests, inject any object
+with ``recv(timeout) -> frame | None`` and ``shutdown()`` where ``frame`` has
+``.arbitration_id`` (29-bit) and ``.data`` (bytes).
 
 CONFIDENCE: the PGN/SPN set + scalings below are the STANDARD J1939 definitions
 (SAE J1939-71) and are a starter set — verify against the target ECU's documented
@@ -139,7 +144,8 @@ class J1939ReadTransport(Transport):
         except ModuleNotFoundError as exc:
             raise TransportError(
                 TransportErrorCode.NOT_CONNECTED,
-                "python-can not installed — `pip install castor-hal[j1939]`",
+                "python-can not installed: `pip install 'python-can>=4.0'` (castor-hal "
+                "is not on PyPI; do not install castor-hal[j1939] from there)",
             ) from exc
         try:
             self._bus = can.Bus(channel=self._channel, interface=self._interface)
