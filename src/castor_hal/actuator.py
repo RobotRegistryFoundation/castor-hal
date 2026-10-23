@@ -23,6 +23,7 @@ transport instance directly.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -111,6 +112,7 @@ class TransportActuator:
                 _ESTOP_TOOLS if getattr(described, "can_estop", True) else frozenset())
         self._transport = transport
         self._factory = factory
+        self._build_lock = threading.Lock()
         self._name = name or (transport.name if transport is not None else "castor-transport")
         self._description = description or (
             transport.description if transport is not None else "castor-hal transport actuator"
@@ -130,9 +132,15 @@ class TransportActuator:
         return self._config_schema
 
     def _ensure_transport(self, config: dict) -> Transport:
+        # Built once, under a lock. robot-md-gateway#35 sends the declared stop
+        # from its own thread while requests run on its worker pool; two first
+        # calls racing here built two transports, and the stop could land on
+        # the one thrown away.
         if self._transport is None:
-            assert self._factory is not None  # guaranteed by __init__
-            self._transport = self._factory(config or {})
+            with self._build_lock:
+                if self._transport is None:
+                    assert self._factory is not None  # guaranteed by __init__
+                    self._transport = self._factory(config or {})
         self._transport.open()
         return self._transport
 

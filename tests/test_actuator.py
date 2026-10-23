@@ -2,6 +2,8 @@
 Transport and returns a structured ActuatorOutcome. This is the contract the
 whole HAL exists to satisfy, so it's tested hardest."""
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -278,3 +280,43 @@ def test_a_transport_that_cannot_stop_declares_no_stop(make_fake):
     a = TransportActuator(Tap())
     assert a.stop_capabilities == frozenset()
     assert a.motion_capabilities == frozenset()
+
+
+# -- a lazily built transport, built once ----------------------------------
+
+
+def test_a_stop_and_a_goal_on_first_use_reach_the_same_transport(make_fake):
+    """robot-md-gateway#35 sends castor-hal's declared stop from its own
+    watchdog thread, while requests run on its worker pool. On first use both
+    could build a transport: the stop went to one, the goal to the other, and
+    the one kept was never stopped (review of castor-hal#1, note 1). Now one
+    transport is built, and the one kept is the one stopped."""
+    built = []
+
+    def slow_factory(config):
+        time.sleep(0.2)                            # a serial or CAN bring-up
+        transport = make_fake()
+        built.append(transport)
+        return transport
+
+    a = TransportActuator(factory=slow_factory, transport_type=make_fake)
+    start = threading.Barrier(2)
+    outcomes = {}
+
+    def call(tool, args=None):
+        start.wait()
+        outcomes[tool] = _exec(a, tool, args)
+
+    threads = [threading.Thread(target=call, args=("emergency_stop",)),
+               threading.Thread(target=call, args=("move", {"joint_positions": {"j1": 0.5}}))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert len(built) == 1, f"{len(built)} transports were built"
+    [transport] = built
+    assert a._transport is transport
+    assert transport.estop_calls == 1                       # the stop reached the one kept
+    assert transport.last_goal is not None                  # and so did the goal
+    assert outcomes["emergency_stop"].success and outcomes["move"].success
