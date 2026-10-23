@@ -272,6 +272,16 @@ def test_transport_type_goes_only_with_a_factory(fake):
         TransportActuator(fake, transport_type=type(fake))
 
 
+@pytest.mark.parametrize("wrong", [object, "FakeTransport", 3])
+def test_transport_type_must_be_a_transport_subclass(make_fake, wrong):
+    """The declarations are read off it, so it has to be a Transport class: not
+    another class, a name or an instance."""
+    with pytest.raises(TypeError):
+        TransportActuator(factory=lambda config: make_fake(), transport_type=wrong)
+    with pytest.raises(TypeError):
+        TransportActuator(factory=lambda config: make_fake(), transport_type=make_fake())
+
+
 def test_a_transport_that_cannot_stop_declares_no_stop(make_fake):
     class Tap(make_fake):
         capabilities = frozenset()

@@ -105,6 +105,10 @@ class TransportActuator:
         if transport_type is not None and factory is None:
             raise ValueError("transport_type= describes what factory= builds; "
                              "with transport=, the instance is read instead")
+        if transport_type is not None and not (
+                isinstance(transport_type, type) and issubclass(transport_type, Transport)):
+            raise TypeError(f"transport_type= must be a Transport subclass, "
+                            f"not {transport_type!r}")
         described = transport if transport is not None else transport_type
         if described is not None:
             self.motion_capabilities = goal_tool_names(described.capabilities)
