@@ -63,11 +63,22 @@ robot-md-gateway reads both, and matches tool names exactly:
 
 The two never overlap. A goal tool reaches the transport only when it is in
 `motion_capabilities` and spelled exactly as declared (`MOVE` is refused; send
-`move`), and only when the transport accepts its goal kind. A stop is still
-recognised in any case. A transport built lazily with `factory=` declares from
-`transport_type=` if you pass it. Without it, its type is not known when the
-gateway reads the declarations, so they fail safe: every goal tool is declared
-as motion, and the stops are declared.
+`move`), and only when the transport accepts its goal kind.
+
+Only the four declared stop spellings, sent exactly, get through a tripped
+gateway: `estop`, `stop`, `emergency_stop` and `halt`. castor-hal still routes
+other cases and spacing (`ESTOP`, `" halt"`) to `estop`, but the gateway matches
+declarations exactly: such a spelling needs its own allowlist entry, and a
+tripped gateway refuses it. Allowlist the four and send them exactly. With more
+than one castor-hal actuator on a gateway, each declares the same four, so a
+stop must name its actuator (`actuator_name`); the gateway refuses one that
+does not. The gateway's own stop on a trip goes to every actuator that declares
+one.
+
+A transport built lazily with `factory=` declares from `transport_type=` if you
+pass it. Without it, its type is not known when the gateway reads the
+declarations, so they fail safe: every goal tool is declared as motion, and the
+stops are declared.
 
 ## SAFETY (binding)
 

@@ -57,7 +57,7 @@ class TransportActuator:
         gateway still lets a declared stop through, and sends this actuator
         the first one, sorted (``emergency_stop``), when it trips. The stop is
         routed whatever its case (``ESTOP`` stops too), but only these
-        spellings are declared.
+        spellings are declared, so only they get through a tripped gateway.
 
     ``motion_capabilities``: every tool name that can reach ``set_goal``: the
         names ``parse_goal`` maps to the goal kinds the transport accepts
