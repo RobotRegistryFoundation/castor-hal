@@ -9,9 +9,10 @@ final actuation step to an object implementing its ``Actuator`` Protocol
 ``TransportActuator`` implements that Protocol ONCE, for every transport: it
 parses the envelope into a normalized ``Goal`` (``parse_goal``), routes
 ``read_state``/``estop`` to the transport's own methods, calls ``set_goal`` for
-everything else, and turns transport success/``TransportError``/unexpected
-exceptions into a structured ``ActuatorOutcome``. Writing a new device driver is
-now: implement ``Transport`` (5 methods) — the gateway plumbing is free.
+the goal tools it declares (``motion_capabilities``) and refuses any other, and
+turns transport success/``TransportError``/unexpected exceptions into a
+structured ``ActuatorOutcome``. Writing a new device driver is now: implement
+``Transport`` (5 methods) — the gateway plumbing is free.
 
 The gateway discovers actuator CLASSES via entry-points and instantiates them
 with NO args, then passes its config to ``execute``. So a transport that needs
@@ -22,13 +23,15 @@ transport instance directly.
 
 from __future__ import annotations
 
+import logging
+import threading
 from pathlib import Path
 from typing import Callable
 
 from robot_md_gateway.actuator import ActuatorOutcome
 
 from castor_hal.errors import TransportError, TransportErrorCode
-from castor_hal.goal import parse_goal
+from castor_hal.goal import GoalKind, goal_tool_names, parse_goal
 from castor_hal.state import serialize_state
 from castor_hal.transport import Transport
 
@@ -36,32 +39,90 @@ from castor_hal.transport import Transport
 _READ_TOOLS = frozenset({"read_state", "get_state", "read"})
 _ESTOP_TOOLS = frozenset({"estop", "stop", "emergency_stop", "halt"})
 
+#: Every tool name ``parse_goal`` maps to a goal, whatever the transport: what a
+#: transport whose goal kinds are not known yet is declared to accept.
+_GOAL_TOOLS = goal_tool_names(GoalKind)
+
 
 class TransportActuator:
     """Adapt a ``Transport`` to the gateway's ``Actuator`` Protocol.
+
+    Two declarations tell robot-md-gateway which of its tools stop the machine
+    and which move it. The gateway reads them off the instance and matches tool
+    names EXACTLY, so they list exact spellings:
+
+    ``stop_capabilities``: ``estop``, ``stop``, ``emergency_stop`` and
+        ``halt``, the tools routed to ``Transport.estop``, when the transport
+        can stop (``Transport.can_estop``); none when it cannot (a read-only
+        tap, whose ``estop`` refuses). From robot-md-gateway#35 on, a tripped
+        gateway still lets a declared stop through, and sends this actuator
+        the first one, sorted (``emergency_stop``), when it trips. The stop is
+        routed whatever its case (``ESTOP`` stops too), but only these
+        spellings are declared, so only they get through a tripped gateway.
+
+    ``motion_capabilities``: every tool name that can reach ``set_goal``: the
+        names ``parse_goal`` maps to the goal kinds the transport accepts
+        (``GOAL_TOOL_NAMES``). Every goal actuates the machine, so the gateway
+        treats all of them as motion: an actuation scope, the motion HiTL and
+        confidence gates, and a stop on the allowlist. ``execute`` refuses a
+        goal tool that is not in this set, spelled exactly as it is here, so
+        the set is never smaller than what can move the machine.
+
+    The two never overlap. A transport built lazily (``factory=``) is not
+    known until the first ``execute``, long after the gateway has read these.
+    Pass ``transport_type=`` to declare from its class; without it the
+    declarations fail safe: every goal tool is declared as motion, and the
+    stop tools are declared.
 
     Args:
         transport: a ready ``Transport`` instance (tests / direct use), OR
         factory: ``Callable[[dict], Transport]`` built lazily from the gateway
             ``config`` on first ``execute`` (the entry-point path). Exactly one
-            of ``transport``/``factory`` must be given.
+            of ``transport``/``factory`` must be given. Keep I/O out of the
+            factory and do it in ``open()``: every first call waits for the
+            factory, the gateway's stop included.
+        transport_type: with ``factory`` only: the ``Transport`` class it
+            builds, read for ``capabilities`` and ``can_estop`` (class
+            attributes) to make the declarations above. If the factory builds
+            something else, or a transport whose ``can_estop`` disagrees with
+            the declaration, the first build says so at ERROR and carries on.
         name/description: actuator identity surfaced to the gateway.
         config_schema: JSON-schema-ish dict the gateway may surface.
     """
+
+    #: The fail-safe declarations, for a lazily built transport of unknown
+    #: type. ``__init__`` replaces them whenever the transport's class is known.
+    stop_capabilities: frozenset[str] = _ESTOP_TOOLS
+    motion_capabilities: frozenset[str] = _GOAL_TOOLS
 
     def __init__(
         self,
         transport: Transport | None = None,
         *,
         factory: Callable[[dict], Transport] | None = None,
+        transport_type: type[Transport] | None = None,
         name: str | None = None,
         description: str | None = None,
         config_schema: dict | None = None,
     ) -> None:
         if (transport is None) == (factory is None):
             raise ValueError("provide exactly one of transport= or factory=")
+        if transport_type is not None and factory is None:
+            raise ValueError("transport_type= describes what factory= builds; "
+                             "with transport=, the instance is read instead")
+        if transport_type is not None and not (
+                isinstance(transport_type, type) and issubclass(transport_type, Transport)):
+            raise TypeError(f"transport_type= must be a Transport subclass, "
+                            f"not {transport_type!r}")
+        described = transport if transport is not None else transport_type
+        if described is not None:
+            self.motion_capabilities = goal_tool_names(described.capabilities)
+            self.stop_capabilities = (
+                _ESTOP_TOOLS if getattr(described, "can_estop", True) else frozenset())
         self._transport = transport
         self._factory = factory
+        self._transport_type = transport_type
+        self._build_lock = threading.Lock()
         self._name = name or (transport.name if transport is not None else "castor-transport")
         self._description = description or (
             transport.description if transport is not None else "castor-hal transport actuator"
@@ -81,11 +142,56 @@ class TransportActuator:
         return self._config_schema
 
     def _ensure_transport(self, config: dict) -> Transport:
-        if self._transport is None:
-            assert self._factory is not None  # guaranteed by __init__
-            self._transport = self._factory(config or {})
-        self._transport.open()
+        # Built once and opened under one lock. robot-md-gateway#35 sends the
+        # declared stop from its own thread while requests run on its worker
+        # pool. Two first calls racing here built two transports, and the stop
+        # could land on the one thrown away. open() is held too: it is
+        # check-then-act in most adapters, and two first calls opening one
+        # exclusive device left one of them with EBUSY, the stop included.
+        # open() is idempotent, so after the first call this holds the lock
+        # only for a no-op.
+        with self._build_lock:
+            if self._transport is None:
+                assert self._factory is not None  # guaranteed by __init__
+                self._transport = self._factory(config or {})
+                self._check_built(self._transport)
+            self._transport.open()
         return self._transport
+
+    def _check_built(self, transport: Transport) -> None:
+        """Log at ERROR when the transport a factory built is not what the
+        gateway was told. Never raises: the first build can be the gateway's own
+        stop, and refusing that is worse than a wrong declaration. Goals stay
+        bounded either way (the exact spelling against ``motion_capabilities``,
+        then the live transport's ``ensure_supported``); what a mismatch can make
+        wrong is the stop: one the gateway counts on that the transport refuses,
+        or one the transport has that the gateway was never told about."""
+        log = logging.getLogger(__name__)
+        try:
+            if self._transport_type is not None and not isinstance(transport, self._transport_type):
+                log.error(
+                    "transport_type_mismatch: actuator %r declared transport_type %s, but "
+                    "its factory built %s; what it declared to the gateway may be wrong",
+                    self._name, self._transport_type.__name__, type(transport).__name__,
+                )
+            declared = bool(self.stop_capabilities)
+            can_stop = bool(getattr(transport, "can_estop", True))
+            if declared and not can_stop:
+                log.error(
+                    "stop_declared_but_refused: actuator %r declared %s to the gateway as "
+                    "stops, but the transport it built cannot stop (can_estop is False); "
+                    "the gateway counts on a stop this actuator refuses. Pass transport_type=.",
+                    self._name, ", ".join(sorted(self.stop_capabilities)),
+                )
+            elif can_stop and not declared:
+                log.error(
+                    "stop_not_declared: actuator %r declared no stop to the gateway, but the "
+                    "transport it built can stop (can_estop is True); the gateway will not "
+                    "send it a stop on a trip",
+                    self._name,
+                )
+        except Exception:  # a check must never refuse the call that built the transport
+            log.exception("could not check the transport built for actuator %r", self._name)
 
     def execute(
         self,
@@ -113,6 +219,20 @@ class TransportActuator:
                     success=True, outcome_kind="executed", telemetry={"estopped": True}
                 )
 
+            # Only a goal tool declared in motion_capabilities, spelled exactly
+            # as declared, goes on to the transport. parse_goal ignores case and
+            # surrounding space, and the gateway does not: "MOVE" used to move
+            # the machine while the gateway's motion gates (actuation scope,
+            # HiTL, confidence) did not count it as motion.
+            if tool_name not in self.motion_capabilities:
+                hint = f"; send it as {name!r}" if name in self.motion_capabilities else ""
+                raise TransportError(
+                    TransportErrorCode.UNSUPPORTED_GOAL,
+                    f"{self.name!r} declares no goal tool {tool_name!r}{hint}",
+                    detail={"tool": tool_name,
+                            "motion_capabilities": sorted(self.motion_capabilities)},
+                )
+
             # parse_goal's contract is "a Goal or a TransportError, never raw".
             # Belt-and-suspenders so a future parser slip surfaces as INVALID_GOAL
             # (operator-actionable) rather than INTERNAL (review finding #2).
@@ -126,6 +246,11 @@ class TransportActuator:
                     f"could not parse goal for {tool_name!r}: {exc}",
                     detail={"tool": tool_name},
                 ) from exc
+            # Checked here as well as by the adapter, which is asked to (see
+            # Transport.ensure_supported): motion_capabilities is derived from
+            # the transport's capabilities, and this keeps that declaration
+            # true for an adapter whose set_goal forgets to check.
+            transport.ensure_supported(goal)
             result = transport.set_goal(goal)
             telemetry: dict = {"reached": bool(result.reached), "goal_kind": goal.kind.value}
             if result.detail:

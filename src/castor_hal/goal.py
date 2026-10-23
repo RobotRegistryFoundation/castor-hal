@@ -19,6 +19,7 @@ PURE module: no I/O, no gateway import — safe to import anywhere.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -129,6 +130,28 @@ GOAL_TYPES = (
 )
 
 
+#: The tool names ``parse_goal`` maps to each goal kind, lower case. The one
+#: table the parser and the gateway bridge's declarations
+#: (``TransportActuator.motion_capabilities``) both read, so the tools a
+#: transport is declared to accept cannot drift from the tools that reach it.
+GOAL_TOOL_NAMES: dict[GoalKind, frozenset[str]] = {
+    GoalKind.JOINT_POSITIONS: frozenset({"move", "set_joint_positions", "joint_positions"}),
+    GoalKind.HOME: frozenset({"home", "go_home"}),
+    GoalKind.BODY_TWIST: frozenset({"set_velocity", "cmd_vel", "drive", "body_twist"}),
+    GoalKind.GRIPPER: frozenset({"set_gripper", "gripper"}),
+    GoalKind.RATE_SETPOINT: frozenset({"set_rate", "rate_setpoint"}),
+    GoalKind.SECTION_STATE: frozenset({"set_sections", "section_state"}),
+    GoalKind.FLIGHT_SETPOINT: frozenset({"flight_setpoint", "goto"}),
+    GoalKind.JOINT_TRAJECTORY: frozenset({"set_trajectory", "joint_trajectory"}),
+}
+
+
+def goal_tool_names(kinds: Iterable[GoalKind | str]) -> frozenset[str]:
+    """Every tool name ``parse_goal`` maps to one of ``kinds``. A kind that is not
+    a ``GoalKind`` (or its string value) raises ValueError."""
+    return frozenset().union(*(GOAL_TOOL_NAMES[GoalKind(kind)] for kind in kinds))
+
+
 def _require(args: dict, key: str, tool: str):
     if key not in args:
         raise TransportError(
@@ -176,7 +199,7 @@ def parse_goal(tool_name: str, tool_args: dict | None):
     args = tool_args or {}
     name = (tool_name or "").strip().lower()
 
-    if name in ("move", "set_joint_positions", "joint_positions"):
+    if name in GOAL_TOOL_NAMES[GoalKind.JOINT_POSITIONS]:
         positions = args.get("joint_positions", args.get("positions"))
         if not isinstance(positions, dict) or not positions:
             raise TransportError(
@@ -189,10 +212,10 @@ def parse_goal(tool_name: str, tool_args: dict | None):
             unit=str(args.get("unit", "rad")),
         )
 
-    if name in ("home", "go_home"):
+    if name in GOAL_TOOL_NAMES[GoalKind.HOME]:
         return Home()
 
-    if name in ("set_velocity", "cmd_vel", "drive", "body_twist"):
+    if name in GOAL_TOOL_NAMES[GoalKind.BODY_TWIST]:
         raw_lin = args.get("linear", (0.0, 0.0, 0.0))
         raw_ang = args.get("angular", (0.0, 0.0, 0.0))
         if (not isinstance(raw_lin, (list, tuple)) or len(raw_lin) != 3
@@ -203,19 +226,19 @@ def parse_goal(tool_name: str, tool_args: dict | None):
         ang = tuple(_num(x, "angular", name) for x in raw_ang)
         return BodyTwist(linear=lin, angular=ang)  # type: ignore[arg-type]
 
-    if name in ("set_gripper", "gripper"):
+    if name in GOAL_TOOL_NAMES[GoalKind.GRIPPER]:
         pos = _num(_require(args, "position", name), "position", name)
         effort = args.get("effort")
         return Gripper(position=pos, effort=None if effort is None else _num(effort, "effort", name))
 
-    if name in ("set_rate", "rate_setpoint"):
+    if name in GOAL_TOOL_NAMES[GoalKind.RATE_SETPOINT]:
         return RateSetpoint(
             rate=_num(_require(args, "rate", name), "rate", name),
             unit=str(_require(args, "unit", name)),
             product=args.get("product"),
         )
 
-    if name in ("set_sections", "section_state"):
+    if name in GOAL_TOOL_NAMES[GoalKind.SECTION_STATE]:
         raw = _require(args, "sections", name)
         try:
             if isinstance(raw, dict):
@@ -230,7 +253,7 @@ def parse_goal(tool_name: str, tool_args: dict | None):
                                  f"{name!r} 'sections' keys must be integer indices", detail={"tool": name}) from e
         return SectionState(sections=sections)
 
-    if name in ("flight_setpoint", "goto"):
+    if name in GOAL_TOOL_NAMES[GoalKind.FLIGHT_SETPOINT]:
         return FlightSetpoint(
             north_m=_num(_require(args, "north_m", name), "north_m", name),
             east_m=_num(_require(args, "east_m", name), "east_m", name),
@@ -238,7 +261,7 @@ def parse_goal(tool_name: str, tool_args: dict | None):
             yaw_rad=_num(args.get("yaw_rad", 0.0), "yaw_rad", name),
         )
 
-    if name in ("set_trajectory", "joint_trajectory"):
+    if name in GOAL_TOOL_NAMES[GoalKind.JOINT_TRAJECTORY]:
         pts_raw = _require(args, "points", name)
         if not isinstance(pts_raw, (list, tuple)) or not pts_raw:
             raise TransportError(TransportErrorCode.INVALID_GOAL,

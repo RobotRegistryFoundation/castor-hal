@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "castor-hal"
-version = "0.1.1"
+version = "0.2.0"
 description = "Transport hardware-abstraction layer for robot-md-gateway — one actuator interface fronts serial, CAN/J1939, ISOBUS, ROS 2 and MAVLink."
 readme = "README.md"
 requires-python = ">=3.10"

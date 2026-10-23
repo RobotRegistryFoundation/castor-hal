@@ -168,3 +168,17 @@ def test_bridge_estop_is_structured_error():
     )
     assert out.success is False
     assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+
+
+def test_the_tap_tells_the_gateway_it_has_no_stop_and_no_motion():
+    """It cannot stop the machine and moves nothing, so it declares neither. A
+    declared stop would be one robot-md-gateway counts on (passes through a
+    tripped monitor, sends on a trip) and the tap refuses. The same built
+    directly and built lazily through make_hal_actuator, which tells the
+    actuator its transport type before the tap exists."""
+    from castor_hal.adapters.j1939 import make_hal_actuator
+
+    assert J1939ReadTransport.can_estop is False
+    for a in (TransportActuator(J1939ReadTransport(bus=FakeCanBus([]))), make_hal_actuator()):
+        assert a.stop_capabilities == frozenset()
+        assert a.motion_capabilities == frozenset()

@@ -4,6 +4,7 @@ import pytest
 
 from castor_hal.errors import TransportError, TransportErrorCode
 from castor_hal.goal import (
+    GOAL_TOOL_NAMES,
     BodyTwist,
     FlightSetpoint,
     GoalKind,
@@ -13,6 +14,7 @@ from castor_hal.goal import (
     JointTrajectory,
     RateSetpoint,
     SectionState,
+    goal_tool_names,
     parse_goal,
 )
 
@@ -133,3 +135,46 @@ def test_int_strings_coerce_fine():
     # well-formed numeric strings are still accepted (coercion, not rejection)
     g = parse_goal("move", {"joint_positions": {"j1": "1.5"}})
     assert g.positions["j1"] == 1.5
+
+
+# -- GOAL_TOOL_NAMES: the one table of goal tool names -----------------------
+#
+# parse_goal reads it, and so does TransportActuator.motion_capabilities, the
+# set robot-md-gateway treats as motion. A name the parser accepts and the
+# declaration leaves out would move the machine unseen by the gateway's gates.
+
+#: The smallest valid arguments for each goal kind.
+_VALID_ARGS = {
+    GoalKind.JOINT_POSITIONS: {"joint_positions": {"j1": 0.0}},
+    GoalKind.HOME: {},
+    GoalKind.BODY_TWIST: {},
+    GoalKind.GRIPPER: {"position": 0.5},
+    GoalKind.RATE_SETPOINT: {"rate": 1.0, "unit": "kg/ha"},
+    GoalKind.SECTION_STATE: {"sections": [True]},
+    GoalKind.FLIGHT_SETPOINT: {"north_m": 0.0, "east_m": 0.0, "down_m": 0.0},
+    GoalKind.JOINT_TRAJECTORY: {"points": [{"positions": {"j1": 0.0}}]},
+}
+
+
+def test_every_goal_kind_has_tool_names_and_no_name_has_two_kinds():
+    assert set(GOAL_TOOL_NAMES) == set(GoalKind) == set(_VALID_ARGS)
+    names = [name for tools in GOAL_TOOL_NAMES.values() for name in tools]
+    assert names and len(names) == len(set(names))
+    # Stored as parse_goal compares them, so a declared spelling is one it accepts.
+    assert all(name == name.strip().lower() for name in names)
+
+
+@pytest.mark.parametrize("kind,tool", sorted(
+    ((kind, tool) for kind, tools in GOAL_TOOL_NAMES.items() for tool in tools),
+    key=lambda pair: (pair[0].value, pair[1])))
+def test_every_tool_name_in_the_table_parses_to_its_kind(kind, tool):
+    assert parse_goal(tool, _VALID_ARGS[kind]).kind is kind
+
+
+def test_goal_tool_names_is_the_union_for_the_kinds_asked():
+    assert goal_tool_names([GoalKind.HOME]) == {"home", "go_home"}
+    assert goal_tool_names(["home"]) == {"home", "go_home"}      # a kind's value works too
+    assert goal_tool_names(frozenset()) == frozenset()
+    assert goal_tool_names(GoalKind) == frozenset().union(*GOAL_TOOL_NAMES.values())
+    with pytest.raises(ValueError):
+        goal_tool_names(["teleport"])

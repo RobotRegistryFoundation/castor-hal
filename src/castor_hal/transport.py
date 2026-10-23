@@ -57,6 +57,12 @@ class Transport(ABC):
     #: GoalKinds this transport accepts. Subclasses override.
     capabilities: frozenset[GoalKind] = frozenset()
 
+    #: False only for a transport that cannot command a stop at all, whose
+    #: ``estop`` always refuses (a read-only tap). ``TransportActuator`` then
+    #: declares no stop tools for it, so robot-md-gateway does not count on a
+    #: stop that will be refused. Leave it True for anything that can stop.
+    can_estop: bool = True
+
     #: Human-facing identity (override or set in __init__).
     name: str = "transport"
     description: str = "castor-hal transport"
