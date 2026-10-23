@@ -3,7 +3,9 @@
 All notable changes to `castor-hal`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow semver.
 
-The 0.1.1 entry is reconstructed from the git history, which begins there.
+Nothing here has been tagged or published: the repository has no tags, and
+castor-hal is not on PyPI. The 0.1.1 entry is reconstructed from the git
+history, which begins at 0.1.0.
 
 ## [0.2.0] - 2026-10-23
 
@@ -32,6 +34,13 @@ the review of robot-md-gateway#35 (Q5).
   motion, and the stops are declared. A `transport_type` that is not a
   `Transport` subclass raises `TypeError`. J1939's `make_hal_actuator` passes
   it.
+- **The first build says when it is not what was declared**, at ERROR, and
+  carries on: a factory that builds something other than `transport_type`
+  (`transport_type_mismatch`), or a transport whose `can_estop` disagrees with
+  the stops declared (`stop_declared_but_refused`, `stop_not_declared`). It
+  never refuses the call, because the first build can be the gateway's own
+  stop. A J1939 tap built with `factory=` and no `transport_type=` used to
+  declare four stops it refuses, silently.
 - **`GOAL_TOOL_NAMES`** and **`goal_tool_names()`**: the one table of goal tool
   names, which `parse_goal` now reads too. The names themselves are unchanged.
 
@@ -50,11 +59,21 @@ the review of robot-md-gateway#35 (Q5).
 
 ### Fixed
 
-- **A lazily built transport is built once.** `_ensure_transport` checked and
-  built with no lock. robot-md-gateway#35 sends the declared stop from its own
-  thread while requests run on its worker pool, so on first use a stop and a
-  request could each build a transport, and the stop could land on the copy
-  that was thrown away. A double-checked lock now builds one.
+- **A lazily built transport is built once, and opened once.**
+  `_ensure_transport` checked and built with no lock, then opened.
+  robot-md-gateway#35 sends the declared stop from its own thread while
+  requests run on its worker pool, so on first use a stop and a request could
+  each build a transport, and the stop could land on the copy that was thrown
+  away. Even with one transport, both could open it, and with an exclusive
+  device (a serial port opened exclusively) the second open failed with EBUSY:
+  when that was the stop, nothing stopped. One lock now covers the build and
+  `open()`; `open()` is idempotent, so after the first call the lock is held
+  only for a no-op. Keep I/O out of a factory: every first call waits for it,
+  the gateway's stop included.
+- **The J1939 install instructions** said `pip install castor-hal[j1939]`.
+  castor-hal is not on PyPI, so that would install whatever is later published
+  under the name. They now say to install castor-hal from its repository, with
+  python-can beside it.
 
 ### Known
 
@@ -63,10 +82,18 @@ the review of robot-md-gateway#35 (Q5).
   with HTTP 500 on an allow record. Reporting them as `denied` is a separate
   change, planned for before this version is tagged.
 
-## [0.1.1] - 2026-06-19
+## [0.1.1] - never tagged or published
 
-- The transport HAL (`Goal`, `Transport`, `TransportState`, `TransportError`,
-  `TransportActuator`) and the J1939 read-only telemetry adapter
-  (`castor_hal.adapters.j1939`): standard PGNs normalized into
-  `TransportState.measurements`, no goals accepted, and an `estop()` that
+The version the code carried from 2026-06-19, reconstructed from the git
+history (0.1.0 and 0.1.1, both that day):
+
+- 0.1.0 (4fd8d35): the transport HAL. The `Transport` base class
+  (`open`/`close`/`set_goal`/`read_state`/`estop` plus `capabilities`), the
+  normalized `Goal` kinds and `parse_goal`, `TransportError` and
+  `TransportErrorCode`, `TransportState` and `serialize_state`, and
+  `TransportActuator`, which adapts any `Transport` to robot-md-gateway's
+  `Actuator` protocol.
+- 0.1.1 (75a79f1): the J1939 read-only telemetry adapter
+  (`castor_hal.adapters.j1939`). Standard PGNs are normalized into
+  `TransportState.measurements`; no goals are accepted, and `estop()`
   refuses, because a read-only tap cannot stop a machine.
