@@ -101,6 +101,7 @@ class J1939ReadTransport(Transport):
     """Read-only J1939/CAN telemetry tap. ``capabilities`` is empty by design."""
 
     capabilities = frozenset()  # telemetry-only: accepts NO goals
+    can_estop = False  # and cannot stop the machine: estop() refuses (see below)
     name = "j1939-read"
     description = "read-only J1939/CAN telemetry tap (no actuation)"
 
@@ -220,6 +221,9 @@ def make_hal_actuator(config_dict: dict | None = None):
 
     return TransportActuator(
         factory=J1939ReadTransport.from_config,
+        # Tells the gateway, before the tap is built, that it declares no stop
+        # and no motion tools.
+        transport_type=J1939ReadTransport,
         name="j1939-read",
         description=J1939ReadTransport.description,
     )
