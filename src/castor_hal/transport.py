@@ -79,7 +79,13 @@ class Transport(ABC):
     # -- actuation / sensing ----------------------------------------------
     @abstractmethod
     def set_goal(self, goal) -> GoalResult:
-        """Drive the device toward ``goal``. Raise ``TransportError`` on failure."""
+        """Drive the device toward ``goal``. Raise ``TransportError`` on failure.
+
+        Raise ``UNSUPPORTED_GOAL`` or ``INVALID_GOAL`` only before anything is
+        sent to the device. ``TransportActuator`` reports those two codes as
+        refusals (``denied``), and robot-md-gateway records a refusal as a deny
+        with nothing done. Once anything has been sent, a failure takes any
+        other code (see ``errors``)."""
 
     @abstractmethod
     def read_state(self) -> TransportState:
@@ -89,8 +95,11 @@ class Transport(ABC):
     def estop(self) -> None:
         """Best-effort immediate stop/hold. MUST NOT raise for a routine 'already
         stopped' condition; MAY raise ``TransportError(IO_ERROR)`` only if it
-        cannot even command the stop. See the module SAFETY note: this is not a
-        hardware e-stop."""
+        cannot even command the stop. A transport that cannot command a stop at
+        all (``can_estop = False``, such as a read-only tap) raises
+        ``UNSUPPORTED_GOAL`` without writing anything, which
+        ``TransportActuator`` reports as a refusal. See the module SAFETY note:
+        this is not a hardware e-stop."""
 
     # -- helpers (concrete) -----------------------------------------------
     def supports(self, goal) -> bool:

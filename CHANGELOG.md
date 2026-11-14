@@ -81,7 +81,10 @@ the review of robot-md-gateway#35 (Q5).
   a deny. That includes an adapter's own refusal with either code, such as the
   J1939 tap's `estop()`. Every other code is still an `error`.
   `castor_hal.errors.REFUSAL_CODES` names the two. A client that checked
-  these for `outcome_kind == "error"` sees `denied` now.
+  these for `outcome_kind == "error"` sees `denied` now. An adapter raises
+  either code only before it sends anything, and `Transport.set_goal` and
+  `Transport.estop` now say so, since those are the methods an adapter
+  author reads.
 - **The J1939 install instructions** said `pip install castor-hal[j1939]`.
   castor-hal is not on PyPI, so that would install whatever is later published
   under the name. They now say to install castor-hal from its repository, with
