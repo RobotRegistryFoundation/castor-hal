@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+import castor_hal.actuator as actuator_module
 from castor_hal.actuator import TransportActuator
-from castor_hal.errors import TransportError, TransportErrorCode
+from castor_hal.errors import REFUSAL_CODES, TransportError, TransportErrorCode
 from castor_hal.goal import GoalKind, goal_tool_names
 from castor_hal.state import TransportState
 from castor_hal.transport import GoalResult, Transport
@@ -59,26 +60,40 @@ def test_estop_routes_to_transport(fake):
     assert fake.estopped is True
 
 
-def test_unsupported_goal_is_structured_error_not_a_crash(fake):
+def _assert_refused(out, code: TransportErrorCode) -> None:
+    """A refusal: `denied`, with so-arm101-actuator's `deny`/`reason` and the
+    `error_*` fields this bridge has always sent."""
+    assert out.success is False
+    assert out.outcome_kind == "denied"
+    assert out.telemetry["deny"] == code.value
+    assert out.telemetry["error_code"] == code.value
+    assert out.telemetry["reason"] == out.telemetry["error_message"]
+    assert out.error_message == f"{code.value}: {out.telemetry['reason']}"
+
+
+def test_the_refusal_codes_are_the_two_that_never_reach_the_device():
+    assert REFUSAL_CODES == {TransportErrorCode.UNSUPPORTED_GOAL, TransportErrorCode.INVALID_GOAL}
+
+
+def test_unsupported_goal_is_a_structured_refusal_not_a_crash(fake):
     a = TransportActuator(fake)  # fake accepts only joint_positions/home
     out = _exec(a, "cmd_vel", {"linear": [1, 0, 0]})
-    assert out.success is False
-    assert out.outcome_kind == "error"
-    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    _assert_refused(out, TransportErrorCode.UNSUPPORTED_GOAL)
+    assert out.telemetry["error_detail"]["tool"] == "cmd_vel"
+    assert fake.last_goal is None
 
 
-def test_unknown_tool_is_unsupported_goal_error(fake):
+def test_unknown_tool_is_refused_as_unsupported_goal(fake):
     a = TransportActuator(fake)
     out = _exec(a, "frobnicate")
-    assert out.success is False
-    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    _assert_refused(out, TransportErrorCode.UNSUPPORTED_GOAL)
 
 
-def test_invalid_goal_is_structured_error(fake):
+def test_invalid_goal_is_a_structured_refusal(fake):
     a = TransportActuator(fake)
     out = _exec(a, "move", {})  # missing joint_positions
-    assert out.success is False
-    assert out.telemetry["error_code"] == TransportErrorCode.INVALID_GOAL.value
+    _assert_refused(out, TransportErrorCode.INVALID_GOAL)
+    assert fake.last_goal is None
 
 
 def test_malformed_numeric_goal_is_invalid_not_internal(fake):
@@ -86,9 +101,53 @@ def test_malformed_numeric_goal_is_invalid_not_internal(fake):
     # (operator-actionable), never INTERNAL (looks like an adapter bug).
     a = TransportActuator(fake)
     out = _exec(a, "move", {"joint_positions": {"j1": "not-a-number"}})
-    assert out.success is False
-    assert out.telemetry["error_code"] == TransportErrorCode.INVALID_GOAL.value
+    _assert_refused(out, TransportErrorCode.INVALID_GOAL)
     assert out.telemetry["error_code"] != TransportErrorCode.INTERNAL.value
+
+
+def test_a_parser_that_raises_something_else_is_still_refused_as_invalid_goal(
+        fake, monkeypatch):
+    """The bridge's belt and braces: parse_goal promises a Goal or a
+    TransportError, and anything else it raises is read as INVALID_GOAL."""
+
+    def broken(tool_name, tool_args):
+        raise ValueError("a parser slip")
+
+    monkeypatch.setattr(actuator_module, "parse_goal", broken)
+    out = _exec(TransportActuator(fake), "move", {"joint_positions": {"j1": 0.5}})
+    _assert_refused(out, TransportErrorCode.INVALID_GOAL)
+    assert "a parser slip" in out.telemetry["reason"]
+    assert fake.last_goal is None
+
+
+@pytest.mark.parametrize("code", sorted(REFUSAL_CODES, key=lambda c: c.value))
+def test_an_adapters_own_refusal_in_set_goal_is_denied(make_fake, code):
+    """An adapter raises either code only before it sends anything, so its
+    refusal reads as one too, detail included."""
+
+    class Refuses(make_fake):
+        def set_goal(self, goal) -> GoalResult:
+            raise TransportError(code, "the adapter refused it", detail={"why": "test"})
+
+    out = _exec(TransportActuator(Refuses()), "move", {"joint_positions": {"j1": 0.5}})
+    _assert_refused(out, code)
+    assert out.telemetry["reason"] == "the adapter refused it"
+    assert out.telemetry["error_detail"] == {"why": "test"}
+
+
+@pytest.mark.parametrize("code", sorted(set(TransportErrorCode) - REFUSAL_CODES,
+                                        key=lambda c: c.value))
+def test_every_other_code_stays_an_error(make_fake, code):
+    """A fault, or something that may have reached the device: still `error`,
+    which the gateway answers with a 500 and never signs as a refusal."""
+
+    class Fails(make_fake):
+        def set_goal(self, goal) -> GoalResult:
+            raise TransportError(code, "it went wrong")
+
+    out = _exec(TransportActuator(Fails()), "move", {"joint_positions": {"j1": 0.5}})
+    assert out.success is False and out.outcome_kind == "error"
+    assert out.telemetry == {"error_code": code.value, "error_message": "it went wrong"}
 
 
 def test_not_reached_yields_success_false_but_still_executed(make_fake):
@@ -218,8 +277,7 @@ def test_a_goal_tool_spelled_otherwise_than_declared_is_refused(fake, spelling):
     spelling the gateway cannot see as motion must not move the machine."""
     a = TransportActuator(fake)
     out = _exec(a, spelling, {"joint_positions": {"j1": 0.5}})
-    assert out.success is False and out.outcome_kind == "error"
-    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    _assert_refused(out, TransportErrorCode.UNSUPPORTED_GOAL)
     assert "send it as" in out.error_message
     assert fake.last_goal is None
     assert fake.read_state().positions == {"j1": 0.0}
@@ -252,7 +310,7 @@ def test_the_bridge_checks_the_goal_kind_when_the_adapter_does_not(make_fake):
     a = TransportActuator(factory=lambda config: t)   # declares every goal tool
     assert "move" in a.motion_capabilities
     out = _exec(a, "move", {"joint_positions": {"j1": 0.5}})
-    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    _assert_refused(out, TransportErrorCode.UNSUPPORTED_GOAL)
     assert t.last_goal is None
     assert _exec(a, "home").outcome_kind == "executed"
 

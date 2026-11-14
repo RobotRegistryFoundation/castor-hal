@@ -10,6 +10,10 @@ exactly. With neither declared (review of robot-md-gateway#35, Q5):
 - from robot-md-gateway#35 on, a tripped gateway refused the transport's own
   stop and had nothing to send it on a trip.
 
+The bridge's refusals (`unsupported_goal`, `invalid_goal`) are refusals at
+the gateway too: a signed 403 `actuator_policy`, recorded as a deny. They came
+back as `error`, which the gateway answers with HTTP 500 on an allow record.
+
 In memory only: the real gateway app, a fake transport, a manifest signed at
 test time with a throwaway key.
 """
@@ -23,7 +27,9 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
+from robot_md_gateway.attestation import SigningIdentity
 from robot_md_gateway.cert.audit import AuditChain
+from robot_md_gateway.cert.envelope import canonical_json
 from robot_md_gateway.cert.policy import (
     ToolAllowlist,
     as_tool_set,
@@ -33,6 +39,8 @@ from robot_md_gateway.cert.safety import GatewayState, SafetyMonitor
 from robot_md_gateway.receiver import make_app
 
 from castor_hal.actuator import TransportActuator
+from castor_hal.errors import TransportError, TransportErrorCode
+from castor_hal.transport import GoalResult
 
 KID = "castor-hal-test-manifest"
 BEARERS = {"read-token": "read", "actuate-token": "actuate"}
@@ -162,3 +170,66 @@ def test_a_trip_stops_the_transport_and_its_stop_passes_the_tripped_gateway(
         assert refused.status_code == 403
         assert refused.json()["detail"]["deny"] == "safety_state"
     assert fake.last_goal is None
+
+
+# --------------------------------------------------------------------------- #
+# A refusal from the bridge or an adapter is a refusal at the gateway
+# --------------------------------------------------------------------------- #
+
+
+def _skip_without_deny_records(resolver) -> None:
+    """robot-md-gateway#35 records an actuator's refusal as a deny (and adds
+    /v1/safety/heartbeat in the same change). Earlier gateways answer it with
+    a 403 but record it as an allow."""
+    routes = {getattr(route, "path", None) for route in make_app(resolver=resolver).routes}
+    if "/v1/safety/heartbeat" not in routes:
+        pytest.skip("this robot-md-gateway records an actuator's refusal as an allow "
+                    "(robot-md-gateway#35 records it as a deny)")
+
+
+def _refusing(make_fake, code):
+    class _Refuses(make_fake):
+        def set_goal(self, goal) -> GoalResult:
+            raise TransportError(code, "the adapter refused it before sending anything")
+
+    return _Refuses()
+
+
+@pytest.mark.parametrize("case, tool, args, code", [
+    ("the bridge, a goal kind it does not accept", "cmd_vel", {"linear": [1, 0, 0]},
+     "unsupported_goal"),
+    ("the bridge, a goal it cannot read", "move", {}, "invalid_goal"),
+    ("the adapter's set_goal", "move", {"joint_positions": {"j1": 0.7}}, "unsupported_goal"),
+    ("the adapter's set_goal", "move", {"joint_positions": {"j1": 0.7}}, "invalid_goal"),
+])
+def test_the_gateway_signs_a_refusal_as_a_403_and_records_a_deny(
+        make_fake, signed, manifest, case, tool, args, code):
+    _, resolver = signed
+    _skip_without_deny_records(resolver)
+    transport = (_refusing(make_fake, TransportErrorCode(code))
+                 if case == "the adapter's set_goal" else make_fake())
+    identity = SigningIdentity(priv=Ed25519PrivateKey.generate(), kid="gw-kid", ran=None)
+    chain = AuditChain()
+    app = make_app(resolver=resolver, tool_allowlist=ToolAllowlist(allowed_tools=(tool, "estop")),
+                   bearer_tiers=BEARERS, audit_chain=chain, signing_identity=identity,
+                   actuator=TransportActuator(transport), actuator_config={})
+    with TestClient(app) as http:
+        response = _invoke(http, manifest, tool, scope="MANIPULATE", token="actuate-token",
+                           args=args)
+
+    assert response.status_code == 403, response.text
+    detail = response.json()["detail"]
+    assert detail["deny"] == "actuator_policy"
+    assert detail["reason"].startswith(f"{code}: ")
+    # Signed: the receipt says denied, and its signature verifies.
+    receipt = detail["outcome"]
+    assert detail["attestation"] == "attested" and receipt["status"] == "denied"
+    identity.priv.public_key().verify(
+        base64.b64decode(receipt["envelope_signature"]["sig"]),
+        canonical_json(receipt, exclude="envelope_signature"))
+    # Recorded as a deny, with the bridge's own account alongside.
+    [entry] = [e for e in chain.entries if e.entry_kind == "outcome"]
+    assert entry.decision == "deny"
+    assert entry.decision_reason.startswith(f"actuator_policy: {code}: ")
+    assert entry.actuator_outcome_kind == "denied"
+    assert transport.last_goal is None
