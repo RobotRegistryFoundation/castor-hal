@@ -24,7 +24,9 @@ is free.
   `SectionState`, `Home`). `parse_goal(tool_name, tool_args)` is the one canonical
   mapping from a gateway RCAN envelope to a `Goal`.
 - **`Transport`** — the device-specific seam: `open / close / set_goal /
-  read_state / estop`, plus `capabilities` (the `GoalKind`s it accepts).
+  read_state / estop`, plus `capabilities` (the `GoalKind`s it accepts) and
+  `can_estop` (False only for a transport that cannot stop the machine at all,
+  such as the read-only J1939 tap).
 - **`TransportState` / `serialize_state`** — one normalized telemetry shape.
 - **`TransportError` / `TransportErrorCode`** — one typed failure taxonomy.
 - **`TransportActuator`** — adapts any `Transport` to the gateway's `Actuator`
@@ -44,6 +46,44 @@ class MyTransport(Transport):
 
 actuator = TransportActuator(MyTransport())   # now a valid gateway actuator
 ```
+
+### What the gateway is told
+
+`TransportActuator` declares which tools stop the machine and which move it.
+robot-md-gateway reads both, and matches tool names exactly:
+
+- **`stop_capabilities`** — `estop`, `stop`, `emergency_stop`, `halt`, or none
+  when `can_estop` is False. From robot-md-gateway#35 on, a declared stop gets
+  through a tripped safety monitor, and the gateway sends the first one
+  (`emergency_stop`) itself when it trips.
+- **`motion_capabilities`** — every tool name `parse_goal` maps to a goal kind
+  the transport accepts (`GOAL_TOOL_NAMES`). The gateway treats them all as
+  motion: it requires an actuation scope, runs the motion HiTL and confidence
+  gates, and checks for a stop on the allowlist.
+
+The two never overlap. A goal tool reaches the transport only when it is in
+`motion_capabilities` and spelled exactly as declared (`MOVE` is refused; send
+`move`), and only when the transport accepts its goal kind.
+
+Only the four declared stop spellings, sent exactly, get through a tripped
+gateway: `estop`, `stop`, `emergency_stop` and `halt`. castor-hal still routes
+other cases and spacing (`ESTOP`, `" halt"`) to `estop`, but the gateway matches
+declarations exactly: such a spelling needs its own allowlist entry, and a
+tripped gateway refuses it. Allowlist the four and send them exactly. With more
+than one castor-hal actuator on a gateway, each declares the same four, so a
+stop must name its actuator (`actuator_name`); the gateway refuses one that
+does not. The gateway's own stop on a trip goes to every actuator that declares
+one.
+
+A transport built lazily with `factory=` declares from `transport_type=` if you
+pass it. Without it, its type is not known when the gateway reads the
+declarations, so they fail safe: every goal tool is declared as motion, and the
+stops are declared. If the factory builds something else, or a transport whose
+`can_estop` disagrees with what was declared, the first build logs it at ERROR
+(`transport_type_mismatch`, `stop_declared_but_refused`, `stop_not_declared`)
+and carries on; it never refuses the call. Keep I/O out of the factory and do
+it in `open()`: the build and the first `open()` run under one lock, and every
+first call waits for them, the gateway's stop included.
 
 ## SAFETY (binding)
 

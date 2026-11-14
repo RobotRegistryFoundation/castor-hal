@@ -2,14 +2,24 @@
 Transport and returns a structured ActuatorOutcome. This is the contract the
 whole HAL exists to satisfy, so it's tested hardest."""
 
+import logging
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from castor_hal.actuator import TransportActuator
-from castor_hal.errors import TransportErrorCode
+from castor_hal.errors import TransportError, TransportErrorCode
+from castor_hal.goal import GoalKind, goal_tool_names
+from castor_hal.state import TransportState
+from castor_hal.transport import GoalResult, Transport
 
 MANIFEST = Path("ROBOT.md")
+
+#: The tools the bridge routes to Transport.estop and Transport.read_state.
+STOPS = frozenset({"estop", "stop", "emergency_stop", "halt"})
+READS = frozenset({"read_state", "get_state", "read"})
 
 
 def _exec(actuator, tool_name, tool_args=None, *, tier="actuate", config=None):
@@ -144,3 +154,340 @@ def test_name_defaults_to_transport_name(fake):
     a = TransportActuator(fake)
     assert a.name == "fake"
     assert a.config_schema == {}
+
+
+# -- stop_capabilities / motion_capabilities: what the gateway is told -------
+#
+# robot-md-gateway reads both off the actuator and matches tool names exactly.
+# With neither declared it could not let a castor-hal stop through a tripped
+# safety monitor, could not send one on a trip, and its motion gates (actuation
+# scope, HiTL, confidence) did not see castor-hal motion as motion (review of
+# robot-md-gateway#35, Q5).
+
+
+def test_the_declared_stops_are_the_spellings_routed_to_estop(fake):
+    a = TransportActuator(fake)
+    assert a.stop_capabilities == STOPS
+    for count, tool in enumerate(sorted(a.stop_capabilities), start=1):
+        out = _exec(a, tool, tier="read")
+        assert out.success is True and out.telemetry == {"estopped": True}
+        assert fake.estop_calls == count
+    assert fake.last_goal is None                  # no stop reached set_goal
+
+
+def test_the_declared_motion_is_every_goal_tool_the_transport_accepts(fake):
+    a = TransportActuator(fake)                    # accepts joint_positions and home
+    assert a.motion_capabilities == {"move", "set_joint_positions", "joint_positions",
+                                     "home", "go_home"}
+    for tool in sorted(a.motion_capabilities):
+        fake.last_goal = None
+        out = _exec(a, tool, {"joint_positions": {"j1": 0.25}})
+        assert out.outcome_kind == "executed", out.error_message
+        assert fake.last_goal is not None          # it reached set_goal
+
+
+def test_stops_and_motion_never_overlap(make_fake):
+    """For every way an actuator is built, and for any transport: no tool is
+    both a stop and a motion. A gateway lets a declared stop through a tripped
+    monitor and sends it unprompted on a trip, so a motion tool in both sets
+    would get both."""
+    from castor_hal.adapters.j1939 import J1939ReadTransport
+
+    class EveryGoal(make_fake):
+        capabilities = frozenset(GoalKind)
+
+    built = [
+        TransportActuator(make_fake()),
+        TransportActuator(EveryGoal()),
+        TransportActuator(factory=lambda config: EveryGoal()),            # fail-safe sets
+        TransportActuator(factory=lambda config: EveryGoal(), transport_type=EveryGoal),
+        TransportActuator(J1939ReadTransport()),
+    ]
+    for a in built:
+        assert a.stop_capabilities.isdisjoint(a.motion_capabilities), a.name
+    assert TransportActuator.stop_capabilities.isdisjoint(TransportActuator.motion_capabilities)
+    # Nor could they ever: no stop or read spelling is a goal tool at all.
+    assert STOPS.isdisjoint(goal_tool_names(GoalKind))
+    assert READS.isdisjoint(goal_tool_names(GoalKind))
+    assert STOPS.isdisjoint(READS)
+
+
+@pytest.mark.parametrize("spelling", ["MOVE", "Move", " move", "move ", "HOME"])
+def test_a_goal_tool_spelled_otherwise_than_declared_is_refused(fake, spelling):
+    """parse_goal ignores case and surrounding space; the gateway does not. A
+    spelling the gateway cannot see as motion must not move the machine."""
+    a = TransportActuator(fake)
+    out = _exec(a, spelling, {"joint_positions": {"j1": 0.5}})
+    assert out.success is False and out.outcome_kind == "error"
+    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    assert "send it as" in out.error_message
+    assert fake.last_goal is None
+    assert fake.read_state().positions == {"j1": 0.0}
+
+
+def test_a_stop_spelled_otherwise_still_stops_but_is_not_declared(fake):
+    """The stop stays generous: refusing a stop over its spelling is the wrong
+    failure. Only the exact spellings are declared, because they are all the
+    gateway can match."""
+    a = TransportActuator(fake)
+    for spelling in ("ESTOP", " Halt ", "Emergency_Stop"):
+        assert spelling not in a.stop_capabilities
+        assert _exec(a, spelling).telemetry == {"estopped": True}
+    assert fake.estop_calls == 3
+
+
+def test_the_bridge_checks_the_goal_kind_when_the_adapter_does_not(make_fake):
+    """motion_capabilities is derived from the transport's capabilities. An
+    adapter whose set_goal forgets ensure_supported must not make that
+    declaration false."""
+
+    class Careless(make_fake):
+        capabilities = frozenset({GoalKind.HOME})
+
+        def set_goal(self, goal) -> GoalResult:       # no ensure_supported
+            self.last_goal = goal
+            return GoalResult(reached=True)
+
+    t = Careless()
+    a = TransportActuator(factory=lambda config: t)   # declares every goal tool
+    assert "move" in a.motion_capabilities
+    out = _exec(a, "move", {"joint_positions": {"j1": 0.5}})
+    assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    assert t.last_goal is None
+    assert _exec(a, "home").outcome_kind == "executed"
+
+
+def test_a_lazy_actuator_fails_safe_until_given_its_transport_type(make_fake):
+    """The gateway reads the declarations at startup, before a factory has
+    built anything. Unknown, every goal tool is motion and the stops are
+    declared; with transport_type=, they are exact."""
+    lazy = TransportActuator(factory=lambda config: make_fake())
+    assert lazy.motion_capabilities == goal_tool_names(GoalKind)
+    assert lazy.stop_capabilities == STOPS
+    typed = TransportActuator(factory=lambda config: make_fake(), transport_type=make_fake)
+    assert typed.motion_capabilities == TransportActuator(make_fake()).motion_capabilities
+    assert typed.stop_capabilities == STOPS
+
+
+def test_transport_type_goes_only_with_a_factory(fake):
+    with pytest.raises(ValueError):
+        TransportActuator(fake, transport_type=type(fake))
+
+
+@pytest.mark.parametrize("wrong", [object, "FakeTransport", 3])
+def test_transport_type_must_be_a_transport_subclass(make_fake, wrong):
+    """The declarations are read off it, so it has to be a Transport class: not
+    another class, a name or an instance."""
+    with pytest.raises(TypeError):
+        TransportActuator(factory=lambda config: make_fake(), transport_type=wrong)
+    with pytest.raises(TypeError):
+        TransportActuator(factory=lambda config: make_fake(), transport_type=make_fake())
+
+
+def test_a_transport_that_cannot_stop_declares_no_stop(make_fake):
+    class Tap(make_fake):
+        capabilities = frozenset()
+        can_estop = False
+
+    a = TransportActuator(Tap())
+    assert a.stop_capabilities == frozenset()
+    assert a.motion_capabilities == frozenset()
+
+
+# -- a lazily built transport, built once ----------------------------------
+
+
+def test_a_stop_and_a_goal_on_first_use_reach_the_same_transport(make_fake):
+    """robot-md-gateway#35 sends castor-hal's declared stop from its own
+    watchdog thread, while requests run on its worker pool. On first use both
+    could build a transport: the stop went to one, the goal to the other, and
+    the one kept was never stopped (review of castor-hal#1, note 1). Now one
+    transport is built, and the one kept is the one stopped."""
+    built = []
+
+    def slow_factory(config):
+        time.sleep(0.2)                            # a serial or CAN bring-up
+        transport = make_fake()
+        built.append(transport)
+        return transport
+
+    a = TransportActuator(factory=slow_factory, transport_type=make_fake)
+    start = threading.Barrier(2)
+    outcomes = {}
+
+    def call(tool, args=None):
+        start.wait()
+        outcomes[tool] = _exec(a, tool, args)
+
+    threads = [threading.Thread(target=call, args=("emergency_stop",)),
+               threading.Thread(target=call, args=("move", {"joint_positions": {"j1": 0.5}}))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert len(built) == 1, f"{len(built)} transports were built"
+    [transport] = built
+    assert a._transport is transport
+    assert transport.estop_calls == 1                       # the stop reached the one kept
+    assert transport.last_goal is not None                  # and so did the goal
+    assert outcomes["emergency_stop"].success and outcomes["move"].success
+
+
+class _Exclusive(Transport):
+    """open() as most adapters write it: check, then a slow exclusive open that
+    refuses a second holder (open(2), flock, TIOCEXCL)."""
+
+    capabilities = frozenset({GoalKind.JOINT_POSITIONS})
+    holders = 0
+
+    def __init__(self):
+        self.handle = None
+        self.estop_calls = 0
+
+    def open(self):
+        if self.handle is not None:
+            return
+        time.sleep(0.2)
+        if _Exclusive.holders:
+            raise TransportError(TransportErrorCode.IO_ERROR, "Device or resource busy")
+        _Exclusive.holders += 1
+        self.handle = object()
+
+    def close(self):
+        pass
+
+    def set_goal(self, goal):
+        return GoalResult(reached=True)
+
+    def read_state(self):
+        return TransportState(connected=True, estopped=False, positions={}, timestamp_s=1.0)
+
+    def estop(self):
+        self.estop_calls += 1
+
+
+def test_a_stop_and_a_read_on_first_use_open_an_exclusive_transport_once():
+    """Building once is not enough: the first open() must be once too. With the
+    build locked and the open not, a stop and a request released together each
+    opened the one transport, the second got EBUSY, and when that was the stop,
+    nothing stopped (review of castor-hal#1, round 2, note 1: 5 of 10 trials)."""
+    _Exclusive.holders = 0
+    a = TransportActuator(factory=lambda config: _Exclusive(), transport_type=_Exclusive)
+    start = threading.Barrier(2)
+    outcomes = {}
+
+    def call(tool):
+        start.wait()
+        outcomes[tool] = _exec(a, tool, tier="read")
+
+    threads = [threading.Thread(target=call, args=(tool,))
+               for tool in ("emergency_stop", "read_state")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert outcomes["emergency_stop"].success, outcomes["emergency_stop"].error_message
+    assert outcomes["read_state"].success, outcomes["read_state"].error_message
+    assert a._transport.estop_calls == 1
+    assert _Exclusive.holders == 1
+
+
+# -- the first build says, at ERROR, when it is not what was declared ------
+#
+# It never refuses: the first build can be the gateway's own stop (review of
+# castor-hal#1, round 2).
+
+
+def _errors(caplog) -> str:
+    return "\n".join(r.getMessage() for r in caplog.records
+                     if r.name == "castor_hal.actuator" and r.levelno >= logging.ERROR)
+
+
+class _Elsewhere(Transport):
+    """A transport of some other class: it can stop, and accepts only home."""
+
+    capabilities = frozenset({GoalKind.HOME})
+    name = "elsewhere"
+
+    def __init__(self):
+        self.estop_calls = 0
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    def set_goal(self, goal):
+        return GoalResult(reached=True)
+
+    def read_state(self):
+        return TransportState(connected=True, estopped=False, positions={}, timestamp_s=1.0)
+
+    def estop(self):
+        self.estop_calls += 1
+
+
+def test_a_factory_that_builds_another_type_is_logged_and_the_stop_still_runs(make_fake, caplog):
+    a = TransportActuator(factory=lambda config: _Elsewhere(), transport_type=make_fake,
+                          name="arm")
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        out = _exec(a, "emergency_stop", tier="read")
+    assert out.success is True and a._transport.estop_calls == 1
+    assert "transport_type_mismatch" in _errors(caplog)
+    assert "stop_declared_but_refused" not in _errors(caplog)      # both can stop
+    assert "stop_not_declared" not in _errors(caplog)
+
+
+def test_a_lazy_tap_built_without_its_type_is_logged(make_fake, caplog):
+    """The fail-safe declares the four stops before anything is built. When
+    what gets built cannot stop, the gateway counts on stops it will be
+    refused; round 1 found that silent."""
+
+    class Tap(make_fake):
+        capabilities = frozenset()
+        can_estop = False
+
+    a = TransportActuator(factory=lambda config: Tap(), name="tap")
+    assert a.stop_capabilities == STOPS
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success      # logged, not refused
+    assert "stop_declared_but_refused" in _errors(caplog)
+    assert "transport_type_mismatch" not in _errors(caplog)
+
+
+def test_a_declared_tap_whose_factory_builds_a_transport_that_can_stop_is_logged(
+        make_fake, caplog):
+    class Tap(make_fake):
+        capabilities = frozenset()
+        can_estop = False
+
+    a = TransportActuator(factory=lambda config: make_fake(), transport_type=Tap, name="tap")
+    assert a.stop_capabilities == frozenset()
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success
+    assert "stop_not_declared" in _errors(caplog)
+    assert "transport_type_mismatch" in _errors(caplog)
+
+
+def test_a_factory_that_builds_what_it_declared_logs_nothing(make_fake, caplog):
+    a = TransportActuator(factory=lambda config: make_fake(), transport_type=make_fake)
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        assert _exec(a, "read_state", tier="read").success
+        assert _exec(a, "emergency_stop", tier="read").success
+    assert _errors(caplog) == ""
+
+
+def test_the_check_never_refuses_the_call_that_built(make_fake, caplog):
+    class Odd(make_fake):
+        @property
+        def can_estop(self):
+            raise RuntimeError("cannot say")
+
+    a = TransportActuator(factory=lambda config: Odd(), transport_type=make_fake)
+    with caplog.at_level(logging.ERROR, logger="castor_hal.actuator"):
+        out = _exec(a, "emergency_stop", tier="read")
+    assert out.success is True and a._transport.estop_calls == 1
+    assert "could not check the transport" in _errors(caplog)
