@@ -70,17 +70,22 @@ the review of robot-md-gateway#35 (Q5).
   `open()`; `open()` is idempotent, so after the first call the lock is held
   only for a no-op. Keep I/O out of a factory: every first call waits for it,
   the gateway's stop included.
+- **A refusal is reported as a refusal.** `TransportActuator.execute`
+  returned `unsupported_goal` and `invalid_goal` as `outcome_kind="error"`,
+  which robot-md-gateway answers with HTTP 500 on an allow record. Both mean
+  the request was refused before anything reached the device, so both now
+  come back as `outcome_kind="denied"`, with `deny` and `reason` in telemetry
+  (the shape of so-arm101-actuator's refusals) and `error_code`,
+  `error_message` and `error_detail` as before. robot-md-gateway answers them
+  with a signed 403 `actuator_policy`, and from robot-md-gateway#35 on records
+  a deny. That includes an adapter's own refusal with either code, such as the
+  J1939 tap's `estop()`. Every other code is still an `error`.
+  `castor_hal.errors.REFUSAL_CODES` names the two. A client that checked
+  these for `outcome_kind == "error"` sees `denied` now.
 - **The J1939 install instructions** said `pip install castor-hal[j1939]`.
   castor-hal is not on PyPI, so that would install whatever is later published
   under the name. They now say to install castor-hal from its repository, with
   python-can beside it.
-
-### Known
-
-- The bridge still reports its own refusals (`unsupported_goal`,
-  `invalid_goal`) as `outcome_kind="error"`, which robot-md-gateway answers
-  with HTTP 500 on an allow record. Reporting them as `denied` is a separate
-  change, planned for before this version is tagged.
 
 ## [0.1.1] - never tagged or published
 
