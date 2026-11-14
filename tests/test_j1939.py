@@ -150,24 +150,33 @@ def test_bridge_read_state_returns_measurements():
     assert out.telemetry["measurements"]["engine_speed_rpm"] == pytest.approx(800.0)
 
 
-def test_bridge_refuses_actuation_as_structured_error():
+def test_bridge_refuses_actuation_as_a_structured_refusal():
+    """The tap declares no goal kind, so the bridge refuses a goal before the
+    tap's own set_goal could (test_telemetry_only_refuses_goals): the same
+    code, now reported as a refusal."""
     a = TransportActuator(J1939ReadTransport(bus=FakeCanBus([])))
     out = a.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"j1": 0.0}}},
         manifest_path=Path("ROBOT.md"), tier="actuate", config={},
     )
-    assert out.success is False
+    assert out.success is False and out.outcome_kind == "denied"
+    assert out.telemetry["deny"] == TransportErrorCode.UNSUPPORTED_GOAL.value
     assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
 
 
-def test_bridge_estop_is_structured_error():
+def test_bridge_estop_is_the_taps_own_refusal():
+    """The tap's own estop() refuses (it never writes to the bus), with
+    unsupported_goal: a refusal from the adapter, not a fault. It declares no
+    stop, so the gateway never sends it one on a trip."""
     a = TransportActuator(J1939ReadTransport(bus=FakeCanBus([])))
     out = a.execute(
         envelope={"tool_name": "estop", "tool_args": {}},
         manifest_path=Path("ROBOT.md"), tier="actuate", config={},
     )
-    assert out.success is False
+    assert out.success is False and out.outcome_kind == "denied"
+    assert out.telemetry["deny"] == TransportErrorCode.UNSUPPORTED_GOAL.value
     assert out.telemetry["error_code"] == TransportErrorCode.UNSUPPORTED_GOAL.value
+    assert "hardware e-stop" in out.telemetry["reason"]
 
 
 def test_the_tap_tells_the_gateway_it_has_no_stop_and_no_motion():

@@ -29,9 +29,12 @@ is free.
   such as the read-only J1939 tap).
 - **`TransportState` / `serialize_state`** — one normalized telemetry shape.
 - **`TransportError` / `TransportErrorCode`** — one typed failure taxonomy.
+  Two codes are refusals, raised before anything reaches the device:
+  `unsupported_goal` and `invalid_goal`. Every other code is a fault.
 - **`TransportActuator`** — adapts any `Transport` to the gateway's `Actuator`
   Protocol, turning success / `TransportError` / unexpected exceptions into a
-  structured `ActuatorOutcome`.
+  structured `ActuatorOutcome`: a refusal as `denied` (a signed 403 at the
+  gateway), anything else that went wrong as `error` (a 500).
 
 ```python
 from castor_hal import Transport, TransportActuator, GoalKind, GoalResult, TransportState

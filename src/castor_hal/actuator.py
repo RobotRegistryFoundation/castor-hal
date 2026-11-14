@@ -30,7 +30,7 @@ from typing import Callable
 
 from robot_md_gateway.actuator import ActuatorOutcome
 
-from castor_hal.errors import TransportError, TransportErrorCode
+from castor_hal.errors import REFUSAL_CODES, TransportError, TransportErrorCode
 from castor_hal.goal import GoalKind, goal_tool_names, parse_goal
 from castor_hal.state import serialize_state
 from castor_hal.transport import Transport
@@ -265,6 +265,19 @@ class TransportActuator:
             )
 
         except TransportError as exc:
+            if exc.code in REFUSAL_CODES:
+                # Refused before anything reached the device: a decision, so
+                # the gateway signs a 403 and records a deny, where an "error"
+                # was a 500 on an allow record. The shape of
+                # so-arm101-actuator's refusals (`deny`, `reason`), with the
+                # old `error_*` fields kept for anything that reads them.
+                return ActuatorOutcome(
+                    success=False,
+                    outcome_kind="denied",
+                    error_message=str(exc),
+                    telemetry={"deny": exc.code.value, "reason": exc.message,
+                               **exc.as_dict()},
+                )
             return ActuatorOutcome(
                 success=False,
                 outcome_kind="error",

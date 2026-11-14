@@ -12,6 +12,14 @@ HONESTY/SAFETY: a ``TransportError`` (including ``ESTOPPED``) describes what
 the SOFTWARE transport observed or refused. It is never a safety attestation —
 a refused or stopped command at this layer does NOT prove the machine
 physically stopped; that is the hardware e-stop's job. See ``transport.estop``.
+
+REFUSALS: two codes, ``UNSUPPORTED_GOAL`` and ``INVALID_GOAL``, mean the
+request was refused before anything reached the device: the goal kind is one
+the transport does not accept, or the goal could not be read. An adapter
+raises them only before it sends anything. ``TransportActuator`` reports them
+as ``outcome_kind="denied"``, which robot-md-gateway answers with a signed 403
+(``actuator_policy``) and records as a deny. Every other code is a fault, or
+may have reached the device, and is reported as ``outcome_kind="error"``.
 """
 
 from __future__ import annotations
@@ -24,14 +32,22 @@ class TransportErrorCode(str, Enum):
     rides telemetry/JSON verbatim."""
 
     NOT_CONNECTED = "not_connected"      # open() not called / link down
-    UNSUPPORTED_GOAL = "unsupported_goal"  # this transport can't accept this GoalKind
-    INVALID_GOAL = "invalid_goal"        # goal malformed (missing/garbage fields)
+    UNSUPPORTED_GOAL = "unsupported_goal"  # this transport can't accept this GoalKind (a refusal)
+    INVALID_GOAL = "invalid_goal"        # goal malformed (missing/garbage fields) (a refusal)
     UNKNOWN_TARGET = "unknown_target"    # a named joint/section/axis the device doesn't have
     OUT_OF_RANGE = "out_of_range"        # a value outside the device's declared limits
     TIMEOUT = "timeout"                  # the device didn't reach/ack in time
     ESTOPPED = "estopped"                # a command refused because the transport is stopped
     IO_ERROR = "io_error"               # serial/CAN/socket wire failure
     INTERNAL = "internal"                # an unexpected adapter bug
+
+
+#: The codes that mean "refused before anything reached the device" (see the
+#: module docstring). Reported to the gateway as decisions, not faults.
+REFUSAL_CODES: frozenset[TransportErrorCode] = frozenset({
+    TransportErrorCode.UNSUPPORTED_GOAL,
+    TransportErrorCode.INVALID_GOAL,
+})
 
 
 class TransportError(Exception):
