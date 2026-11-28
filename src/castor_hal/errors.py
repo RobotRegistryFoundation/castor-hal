@@ -13,13 +13,13 @@ the SOFTWARE transport observed or refused. It is never a safety attestation —
 a refused or stopped command at this layer does NOT prove the machine
 physically stopped; that is the hardware e-stop's job. See ``transport.estop``.
 
-REFUSALS: two codes, ``UNSUPPORTED_GOAL`` and ``INVALID_GOAL``, mean the
-request was refused before anything reached the device: the goal kind is one
-the transport does not accept, or the goal could not be read. An adapter
-raises them only before it sends anything. ``TransportActuator`` reports them
-as ``outcome_kind="denied"``, which robot-md-gateway answers with a signed 403
-(``actuator_policy``) and records as a deny. Every other code is a fault, or
-may have reached the device, and is reported as ``outcome_kind="error"``.
+REFUSALS: five pre-actuation codes — ``UNSUPPORTED_GOAL``, ``INVALID_GOAL``,
+``OUT_OF_RANGE``, ``UNKNOWN_TARGET``, and ``ESTOPPED`` — mean the request was
+refused before anything reached the device. An adapter raises them only before
+it sends anything. ``TransportActuator`` reports them as ``outcome_kind="denied"``,
+which robot-md-gateway answers with a signed 403 (``actuator_policy``) and
+records as a deny. Every other code is a fault, or may have reached the device,
+and is reported as ``outcome_kind="error"``.
 """
 
 from __future__ import annotations
@@ -47,6 +47,9 @@ class TransportErrorCode(str, Enum):
 REFUSAL_CODES: frozenset[TransportErrorCode] = frozenset({
     TransportErrorCode.UNSUPPORTED_GOAL,
     TransportErrorCode.INVALID_GOAL,
+    TransportErrorCode.OUT_OF_RANGE,
+    TransportErrorCode.UNKNOWN_TARGET,
+    TransportErrorCode.ESTOPPED,
 })
 
 

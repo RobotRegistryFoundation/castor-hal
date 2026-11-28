@@ -38,6 +38,7 @@ from castor_hal.transport import Transport
 # Tool names that are transport METHODS, not goals — dispatched before parse_goal.
 _READ_TOOLS = frozenset({"read_state", "get_state", "read"})
 _ESTOP_TOOLS = frozenset({"estop", "stop", "emergency_stop", "halt"})
+_CLEAR_ESTOP_TOOLS = frozenset({"clear_estop", "estop_clear", "estop.clear"})
 
 #: Every tool name ``parse_goal`` maps to a goal, whatever the transport: what a
 #: transport whose goal kinds are not known yet is declared to accept.
@@ -158,6 +159,13 @@ class TransportActuator:
             self._transport.open()
         return self._transport
 
+    def close(self) -> None:
+        """Close the underlying transport if it has been constructed. Idempotent."""
+        with self._build_lock:
+            transport = self._transport
+            if transport is not None:
+                transport.close()
+
     def _check_built(self, transport: Transport) -> None:
         """Log at ERROR when the transport a factory built is not what the
         gateway was told. Never raises: the first build can be the gateway's own
@@ -217,6 +225,36 @@ class TransportActuator:
                 transport.estop()
                 return ActuatorOutcome(
                     success=True, outcome_kind="executed", telemetry={"estopped": True}
+                )
+
+            if name in _CLEAR_ESTOP_TOOLS:
+                # Clearing a software estop makes the transport movable again:
+                # require commission tier, matching so-arm101-actuator and rc-car-actuator.
+                if tier != "commission":
+                    return ActuatorOutcome(
+                        success=False,
+                        outcome_kind="denied",
+                        error_message=(
+                            f"tool_tier: tier {tier!r} may not invoke {tool_name!r} "
+                            "(requires 'commission')"
+                        ),
+                        telemetry={
+                            "deny": "tool_tier",
+                            "reason": f"tier {tier!r} may not invoke {tool_name!r} (requires 'commission')",
+                        },
+                    )
+                clear_fn = getattr(transport, "clear_estop", None)
+                if not callable(clear_fn):
+                    raise TransportError(
+                        TransportErrorCode.UNSUPPORTED_GOAL,
+                        f"{self.name!r} does not expose clear_estop()",
+                        detail={"tool": tool_name},
+                    )
+                clear_fn()
+                return ActuatorOutcome(
+                    success=True,
+                    outcome_kind="executed",
+                    telemetry={"estopped": False},
                 )
 
             # Only a goal tool declared in motion_capabilities, spelled exactly
