@@ -71,8 +71,14 @@ def _assert_refused(out, code: TransportErrorCode) -> None:
     assert out.error_message == f"{code.value}: {out.telemetry['reason']}"
 
 
-def test_the_refusal_codes_are_the_two_that_never_reach_the_device():
-    assert REFUSAL_CODES == {TransportErrorCode.UNSUPPORTED_GOAL, TransportErrorCode.INVALID_GOAL}
+def test_the_refusal_codes_are_the_pre_actuation_codes():
+    assert REFUSAL_CODES == {
+        TransportErrorCode.UNSUPPORTED_GOAL,
+        TransportErrorCode.INVALID_GOAL,
+        TransportErrorCode.OUT_OF_RANGE,
+        TransportErrorCode.UNKNOWN_TARGET,
+        TransportErrorCode.ESTOPPED,
+    }
 
 
 def test_unsupported_goal_is_a_structured_refusal_not_a_crash(fake):

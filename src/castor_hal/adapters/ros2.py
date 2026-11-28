@@ -85,11 +85,16 @@ class RclpyBridge:
         self._rclpy = rclpy
         self._Twist = Twist
         self._JointState = JointState
+        self._read_only = cfg.read_only
         if not rclpy.ok():
             rclpy.init(args=None)
         self._node = rclpy.create_node(cfg.node_name)
-        self._vel_pub = self._node.create_publisher(Twist, cfg.cmd_vel_topic, 10)
-        self._joint_pub = self._node.create_publisher(JointState, cfg.joint_cmd_topic, 10)
+        if cfg.read_only:
+            self._vel_pub = None
+            self._joint_pub = None
+        else:
+            self._vel_pub = self._node.create_publisher(Twist, cfg.cmd_vel_topic, 10)
+            self._joint_pub = self._node.create_publisher(JointState, cfg.joint_cmd_topic, 10)
         self._last_joints: tuple[dict[str, float], dict[str, float]] = ({}, {})
         self._last_odom: dict[str, float] = {}
         self._last_rx: dict[str, float] = {}
@@ -116,12 +121,16 @@ class RclpyBridge:
         self._rclpy.spin_once(self._node, timeout_sec=0.01)
 
     def publish_twist(self, topic: str, linear: tuple[float, float, float], angular: tuple[float, float, float]) -> None:
+        if self._vel_pub is None:
+            raise TransportError(TransportErrorCode.UNSUPPORTED_GOAL, "read-only ROS2 bridge cannot publish twist")
         msg = self._Twist()
         msg.linear.x, msg.linear.y, msg.linear.z = linear
         msg.angular.x, msg.angular.y, msg.angular.z = angular
         self._vel_pub.publish(msg)
 
     def publish_joint_positions(self, topic: str, positions: dict[str, float]) -> None:
+        if self._joint_pub is None:
+            raise TransportError(TransportErrorCode.UNSUPPORTED_GOAL, "read-only ROS2 bridge cannot publish joint positions")
         msg = self._JointState()
         msg.name = list(positions.keys())
         msg.position = [float(v) for v in positions.values()]
@@ -148,6 +157,12 @@ class ROS2Transport(Transport):
 
     name = "ros2"
     description = "ROS 2 (rclpy) bounded cmd_vel / joint_states transport"
+    capabilities: frozenset[GoalKind] = frozenset({
+        GoalKind.BODY_TWIST,
+        GoalKind.JOINT_POSITIONS,
+        GoalKind.HOME,
+    })
+    can_estop: bool = True
 
     def __init__(
         self,
@@ -160,11 +175,12 @@ class ROS2Transport(Transport):
         self._backend: ROS2Bridge | None = None
         self._open = False
         self._estopped = False
-        self.capabilities = (
-            frozenset()
-            if self._cfg.read_only
-            else frozenset({GoalKind.BODY_TWIST, GoalKind.JOINT_POSITIONS, GoalKind.HOME})
-        )
+        if self._cfg.read_only:
+            self.capabilities = frozenset()
+            self.can_estop = False
+        else:
+            self.capabilities = type(self).capabilities
+            self.can_estop = type(self).can_estop
 
     def open(self) -> None:
         if self._open:
@@ -190,7 +206,17 @@ class ROS2Transport(Transport):
         self._estopped = False
 
     def estop(self) -> None:
-        """Best-effort software stop: publish zero twist and latch estop."""
+        """Best-effort software stop: publish zero twist and latch estop.
+
+        A read-only ROS 2 tap refuses estop honestly without writing to /cmd_vel,
+        matching J1939ReadTransport (not a hardware e-stop, ISO 13850).
+        """
+        if self._cfg.read_only:
+            raise TransportError(
+                TransportErrorCode.UNSUPPORTED_GOAL,
+                "read-only ROS2Transport cannot command a stop; "
+                "wire a hardware e-stop (this transport never publishes to /cmd_vel)",
+            )
         self._estopped = True
         if self._open and self._backend is not None:
             try:
@@ -250,9 +276,15 @@ class ROS2Transport(Transport):
             home = self._cfg.home_positions
             if not home:
                 # Mobile-only ROS 2 base: home commands zero twist
-                backend.publish_twist(self._cfg.cmd_vel_topic, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+                try:
+                    backend.publish_twist(self._cfg.cmd_vel_topic, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+                except Exception as exc:
+                    raise TransportError(TransportErrorCode.IO_ERROR, f"publish_twist failed: {exc}") from exc
                 return GoalResult(reached=True, state=self.read_state(), detail={"action": "zero_twist"})
-            backend.publish_joint_positions(self._cfg.joint_cmd_topic, home)
+            try:
+                backend.publish_joint_positions(self._cfg.joint_cmd_topic, home)
+            except Exception as exc:
+                raise TransportError(TransportErrorCode.IO_ERROR, f"publish_joint_positions failed: {exc}") from exc
             return GoalResult(reached=True, state=self.read_state(), detail={"topic": self._cfg.joint_cmd_topic, "home": True})
 
         raise TransportError(TransportErrorCode.UNSUPPORTED_GOAL, f"unhandled goal {goal!r}")

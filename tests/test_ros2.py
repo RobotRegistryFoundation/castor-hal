@@ -120,3 +120,104 @@ def test_ros2_not_connected_raises():
     with pytest.raises(TransportError) as exc:
         t.read_state()
     assert exc.value.code is TransportErrorCode.NOT_CONNECTED
+
+
+def test_ros2_class_level_capabilities_work_with_lazy_transport_actuator():
+    """TransportActuator(factory=..., transport_type=ROS2Transport) reads
+    class-level capabilities and can_estop before the instance exists."""
+    from castor_hal.actuator import TransportActuator
+
+    fake = _FakeROS2Bridge()
+    a = TransportActuator(
+        factory=lambda _cfg: ROS2Transport(backend=fake),
+        transport_type=ROS2Transport,
+        name="ros2-lazy",
+    )
+    assert "cmd_vel" in a.motion_capabilities
+    assert "move" in a.motion_capabilities
+    assert "home" in a.motion_capabilities
+    assert "estop" in a.stop_capabilities
+
+    out = a.execute(
+        envelope={"tool_name": "cmd_vel", "tool_args": {"linear": [0.2, 0.0, 0.0]}},
+        manifest_path=None,
+        tier="actuate",
+        config={},
+    )
+    assert out.success is True and out.outcome_kind == "executed"
+    assert fake.twists[-1] == ("/cmd_vel", (0.2, 0.0, 0.0), (0.0, 0.0, 0.0))
+
+
+def test_ros2_read_only_does_not_advertise_estop_or_publish_cmd_vel():
+    from castor_hal.actuator import TransportActuator
+
+    fake = _FakeROS2Bridge()
+    t = ROS2Transport(ROS2Config(read_only=True), backend=fake)
+    assert t.capabilities == frozenset()
+    assert t.can_estop is False
+
+    a = TransportActuator(t)
+    assert a.motion_capabilities == frozenset()
+    assert a.stop_capabilities == frozenset()
+
+    with t:
+        with pytest.raises(TransportError) as exc:
+            t.estop()
+        assert exc.value.code is TransportErrorCode.UNSUPPORTED_GOAL
+    assert fake.twists == []
+
+
+def test_ros2_estop_and_clear_estop_through_transport_actuator():
+    from castor_hal.actuator import TransportActuator
+
+    fake = _FakeROS2Bridge()
+    t = ROS2Transport(backend=fake)
+    a = TransportActuator(t)
+
+    # Estop latches and blocks subsequent motion as a signed refusal (`denied`).
+    stop_out = a.execute(envelope={"tool_name": "estop", "tool_args": {}}, manifest_path=None, tier="read", config={})
+    assert stop_out.success is True and stop_out.telemetry["estopped"] is True
+
+    refused_move = a.execute(
+        envelope={"tool_name": "cmd_vel", "tool_args": {"linear": [0.2, 0.0, 0.0]}},
+        manifest_path=None,
+        tier="actuate",
+        config={},
+    )
+    assert refused_move.success is False
+    assert refused_move.outcome_kind == "denied"
+    assert refused_move.telemetry["deny"] == "estopped"
+
+    # Non-commission tier cannot clear estop.
+    bad_clear = a.execute(
+        envelope={"tool_name": "clear_estop", "tool_args": {}},
+        manifest_path=None,
+        tier="actuate",
+        config={},
+    )
+    assert bad_clear.success is False
+    assert bad_clear.outcome_kind == "denied"
+    assert bad_clear.telemetry["deny"] == "tool_tier"
+
+    # Commission tier clears estop and allows bounded motion again.
+    ok_clear = a.execute(
+        envelope={"tool_name": "clear_estop", "tool_args": {}},
+        manifest_path=None,
+        tier="commission",
+        config={},
+    )
+    assert ok_clear.success is True and ok_clear.telemetry["estopped"] is False
+
+    # Out-of-range velocity is refused (`denied`), not an error (500).
+    too_fast = a.execute(
+        envelope={"tool_name": "cmd_vel", "tool_args": {"linear": [5.0, 0.0, 0.0]}},
+        manifest_path=None,
+        tier="actuate",
+        config={},
+    )
+    assert too_fast.success is False
+    assert too_fast.outcome_kind == "denied"
+    assert too_fast.telemetry["deny"] == "out_of_range"
+
+    a.close()
+    assert t._open is False
